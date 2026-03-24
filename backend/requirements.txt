@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+google-generativeai
+networkx
+sqlparse
+pydantic
+sse-starlette
+python-dotenv
+pytest
+httpx
