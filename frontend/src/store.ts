@@ -44,10 +44,11 @@ export const useStore = create<AppStore>((set) => ({
       id: 'welcome',
       role: 'assistant',
       content:
-        'Welcome! I can help you explore the SAP Order-to-Cash dataset. Try asking:\n\n' +
-        '- "Which products have the most billing documents?"\n' +
-        '- "Trace the full flow of billing document 90504259"\n' +
-        '- "Find sales orders with incomplete flows"',
+        'Hi! I can help you analyze the **Order to Cash** process.\n\n' +
+        'Try asking me questions like:\n' +
+        '\u2022 "Which products have the most billing documents?"\n' +
+        '\u2022 "Trace the flow of billing document 90504259"\n' +
+        '\u2022 "Find sales orders with incomplete flows"',
     },
   ],
   chatLoading: false,

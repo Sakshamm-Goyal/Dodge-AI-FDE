@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useCallback, useMemo, useState } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import { useStore } from '../store';
 import type { GraphNode } from '../types';
@@ -6,17 +6,32 @@ import type { GraphNode } from '../types';
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
 const TYPE_COLORS: Record<string, string> = {
-  SalesOrder: '#4F46E5',
-  Delivery: '#0891B2',
-  BillingDocument: '#059669',
-  JournalEntry: '#D97706',
-  Payment: '#DC2626',
-  Customer: '#7C3AED',
-  Product: '#DB2777',
-  Plant: '#65A30D',
+  SalesOrder: '#6366f1',
+  Delivery: '#3b82f6',
+  BillingDocument: '#60a5fa',
+  JournalEntry: '#93c5fd',
+  Payment: '#e879a0',
+  Customer: '#f472b6',
+  Product: '#fb7185',
+  Plant: '#a78bfa',
 };
 
-export default function GraphPanel() {
+const TYPE_DISPLAY: Record<string, string> = {
+  SalesOrder: 'Sales Order',
+  Delivery: 'Delivery',
+  BillingDocument: 'Billing Document',
+  JournalEntry: 'Journal Entry',
+  Payment: 'Payment',
+  Customer: 'Customer',
+  Product: 'Product',
+  Plant: 'Plant',
+};
+
+interface Props {
+  showLabels: boolean;
+}
+
+export default function GraphPanel({ showLabels }: Props) {
   const {
     nodes,
     edges,
@@ -31,6 +46,20 @@ export default function GraphPanel() {
   } = useStore();
 
   const graphRef = useRef<any>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+
+  // Track container size
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const obs = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width, height });
+    });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
 
   // Fetch initial graph data
   useEffect(() => {
@@ -47,7 +76,7 @@ export default function GraphPanel() {
         setGraphData(
           graphData.nodes.map((n: GraphNode) => ({
             ...n,
-            color: TYPE_COLORS[n.type] || '#6B7280',
+            color: TYPE_COLORS[n.type] || '#94a3b8',
           })),
           graphData.edges,
           graphData.total
@@ -73,7 +102,7 @@ export default function GraphPanel() {
           addGraphData(
             data.nodes.map((n: GraphNode) => ({
               ...n,
-              color: TYPE_COLORS[n.type] || '#6B7280',
+              color: TYPE_COLORS[n.type] || '#94a3b8',
             })),
             data.edges || []
           );
@@ -90,49 +119,50 @@ export default function GraphPanel() {
     (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const isHighlighted = highlightedNodeIds.has(node.id);
       const isSelected = selectedNode?.id === node.id;
-      const radius = isHighlighted ? 6 : isSelected ? 5 : 4;
-      const color = node.color || '#6B7280';
+      const baseRadius = isHighlighted ? 5 : isSelected ? 4.5 : 3.5;
 
-      // Glow effect for highlighted nodes
+      const color = node.color || '#94a3b8';
+
+      // Highlighted glow
       if (isHighlighted) {
         ctx.beginPath();
-        ctx.arc(node.x, node.y, radius + 3, 0, 2 * Math.PI);
-        ctx.fillStyle = color + '40';
+        ctx.arc(node.x, node.y, baseRadius + 8, 0, 2 * Math.PI);
+        ctx.fillStyle = color + '15';
         ctx.fill();
 
         ctx.beginPath();
-        ctx.arc(node.x, node.y, radius + 6, 0, 2 * Math.PI);
-        ctx.fillStyle = color + '20';
+        ctx.arc(node.x, node.y, baseRadius + 4, 0, 2 * Math.PI);
+        ctx.fillStyle = color + '30';
         ctx.fill();
       }
 
-      // Selection ring
-      if (isSelected) {
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, radius + 2, 0, 2 * Math.PI);
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-
-      // Node circle
+      // Node with border
       ctx.beginPath();
-      ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI);
+      ctx.arc(node.x, node.y, baseRadius, 0, 2 * Math.PI);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isSelected ? 2.5 : isHighlighted ? 2 : 1.5;
+      ctx.stroke();
+
+      // Inner dot
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, baseRadius * 0.45, 0, 2 * Math.PI);
       ctx.fillStyle = color;
       ctx.fill();
 
-      // Label at sufficient zoom
-      if (globalScale > 1.5) {
-        const label = node.label || node.id;
-        const fontSize = Math.max(10 / globalScale, 2);
-        ctx.font = `${fontSize}px sans-serif`;
+      // Label when zoomed in or overlay is on
+      if (showLabels && globalScale > 1.2) {
+        const label = node.type || '';
+        const fontSize = Math.max(9 / globalScale, 2);
+        ctx.font = `500 ${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillStyle = '#e5e7eb';
-        ctx.fillText(label, node.x, node.y + radius + 2);
+        ctx.fillStyle = '#64748b';
+        ctx.fillText(label, node.x, node.y + baseRadius + 2);
       }
     },
-    [highlightedNodeIds, selectedNode]
+    [highlightedNodeIds, selectedNode, showLabels]
   );
 
   // Graph data formatted for react-force-graph
@@ -146,74 +176,87 @@ export default function GraphPanel() {
 
   if (graphLoading) {
     return (
-      <div className="graph-panel loading">
+      <div className="graph-panel loading" ref={containerRef}>
         <div className="spinner" />
-        <p>Loading graph...</p>
+        <p>Loading graph data...</p>
       </div>
     );
   }
 
   return (
-    <div className="graph-panel">
-      <div className="graph-header">
-        <h2>O2C Process Graph</h2>
-        <span className="graph-stats">
-          {nodes.length} nodes / {edges.length} edges
-        </span>
-      </div>
-      <Legend />
+    <div className="graph-panel" ref={containerRef}>
       <ForceGraph2D
         ref={graphRef}
         graphData={graphData}
+        width={dimensions.width}
+        height={dimensions.height}
         nodeCanvasObject={paintNode}
         nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
           ctx.beginPath();
-          ctx.arc(node.x, node.y, 6, 0, 2 * Math.PI);
+          ctx.arc(node.x, node.y, 8, 0, 2 * Math.PI);
           ctx.fillStyle = color;
           ctx.fill();
         }}
-        linkColor={() => '#374151'}
-        linkWidth={0.5}
-        linkDirectionalArrowLength={3}
-        linkDirectionalArrowRelPos={1}
+        linkColor={() => '#bfdbfe'}
+        linkWidth={(link: any) => {
+          const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+          const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+          if (highlightedNodeIds.has(srcId) || highlightedNodeIds.has(tgtId)) return 2;
+          return 0.8;
+        }}
+        linkDirectionalArrowLength={0}
         onNodeClick={handleNodeClick}
-        backgroundColor="#111827"
+        backgroundColor="#f8fafc"
         cooldownTicks={100}
-        onEngineStop={() => graphRef.current?.zoomToFit(400, 50)}
+        onEngineStop={() => graphRef.current?.zoomToFit(400, 80)}
+        d3AlphaDecay={0.02}
+        d3VelocityDecay={0.3}
       />
-      {selectedNode && <NodeDetail node={selectedNode} onClose={() => setSelectedNode(null)} />}
+
+      {/* Node tooltip on hover */}
+      {selectedNode && (
+        <NodeTooltip
+          node={selectedNode}
+          onClose={() => setSelectedNode(null)}
+        />
+      )}
     </div>
   );
 }
 
-function Legend() {
-  return (
-    <div className="legend">
-      {Object.entries(TYPE_COLORS).map(([type, color]) => (
-        <span key={type} className="legend-item">
-          <span className="legend-dot" style={{ backgroundColor: color }} />
-          {type}
-        </span>
-      ))}
-    </div>
-  );
-}
+function NodeTooltip({ node, onClose }: { node: GraphNode; onClose: () => void }) {
+  const entries = Object.entries(node.metadata || {});
+  const visibleEntries = entries.slice(0, 12);
+  const hasMore = entries.length > 12;
 
-function NodeDetail({ node, onClose }: { node: GraphNode; onClose: () => void }) {
   return (
-    <div className="node-detail">
-      <div className="node-detail-header">
-        <h3>{node.label}</h3>
-        <button onClick={onClose}>&times;</button>
+    <div className="node-tooltip" onClick={(e) => e.stopPropagation()}>
+      <div className="tooltip-header">
+        <h3>{TYPE_DISPLAY[node.type] || node.type}</h3>
+        <button className="tooltip-close" onClick={onClose}>&times;</button>
       </div>
-      <div className="node-detail-type">{node.type}</div>
-      <div className="node-detail-meta">
-        {Object.entries(node.metadata || {}).map(([key, value]) => (
-          <div key={key} className="meta-row">
-            <span className="meta-key">{key}</span>
-            <span className="meta-value">{String(value)}</span>
+      <div className="tooltip-body">
+        <div className="tooltip-row">
+          <span className="tooltip-key">Entity</span>
+          <span className="tooltip-val">{TYPE_DISPLAY[node.type] || node.type}</span>
+        </div>
+        {visibleEntries.map(([key, value]) => (
+          <div key={key} className="tooltip-row">
+            <span className="tooltip-key">{key}</span>
+            <span className="tooltip-val">{value != null ? String(value) : ''}</span>
           </div>
         ))}
+        {hasMore && (
+          <div className="tooltip-more">
+            Additional fields hidden for readability
+          </div>
+        )}
+        <div className="tooltip-row connections">
+          <span className="tooltip-key">Connections</span>
+          <span className="tooltip-val">{
+            Object.keys(node.metadata || {}).length > 0 ? '...' : '0'
+          }</span>
+        </div>
       </div>
     </div>
   );
