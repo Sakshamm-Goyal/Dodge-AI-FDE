@@ -258,8 +258,11 @@ SQL executed: {sql}
 Results ({len(sql_results)} rows, showing up to 20):
 {result_preview}
 
-Write a clear, concise answer based on these results:
-- State the key findings with specific numbers and document IDs
+IMPORTANT: Answer ONLY based on the actual result data above. Do NOT use information from prior conversation or memory.
+Report the EXACT values (names, IDs, amounts) from the result rows — do not substitute or guess.
+
+Write a clear, concise answer:
+- State the key findings with specific numbers and document IDs from the results
 - Use bold (**text**) for important values
 - If there are multiple results, present them as a brief list
 - Do NOT include any SQL in your answer
@@ -267,7 +270,7 @@ Write a clear, concise answer based on these results:
 
             model = _get_model(
                 primary=True,
-                system_instruction="You are a data analyst. Summarize SQL query results clearly. Be concise and specific. Use bold for key values.",
+                system_instruction="You are a data analyst. Summarize SQL query results clearly and accurately. Use ONLY the data provided in the results — never guess or use prior context. Be concise and specific. Use bold for key values.",
             )
             answer = await asyncio.to_thread(
                 _call_gemini, model, [{"role": "user", "parts": [summary_prompt]}], 0.2, 1024
