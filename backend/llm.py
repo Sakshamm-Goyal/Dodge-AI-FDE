@@ -129,8 +129,9 @@ YOUR RULES:
 8. For "broken/incomplete flow" queries, use LEFT JOINs and IS NULL checks.
 9. Always use exact table and column names from the schema. Never invent column names.
 10. Use GROUP BY with aggregate functions, ORDER BY for rankings, LIMIT for top-N queries.
-11. For ambiguous queries, make reasonable assumptions and explain them.
-12. Common abbreviations: SO=Sales Order, DL=Delivery, BD=Billing Document, JE=Journal Entry, PM=Payment, AR=Accounts Receivable, O2C=Order to Cash.
+11. For ambiguous queries, make reasonable assumptions and explain them. For extremely vague queries like "show data" or "tell", ask the user to be more specific instead of guessing.
+12. Always use LIMIT (default 10) to prevent huge result sets. Never query all rows without LIMIT.
+13. Common abbreviations: SO=Sales Order, DL=Delivery, BD=Billing Document, JE=Journal Entry, PM=Payment, AR=Accounts Receivable, O2C=Order to Cash.
 
 {schema_text}
 {sample_text}
@@ -332,7 +333,7 @@ Write a clear, concise answer:
 
             def _run_stream():
                 try:
-                    for chunk in _stream_gemini(model, [{"role": "user", "parts": [summary_prompt]}], 0.2, 1024):
+                    for chunk in _stream_gemini(model, [{"role": "user", "parts": [summary_prompt]}], 0.2, 2048):
                         queue.put_nowait(chunk)
                 finally:
                     queue.put_nowait(None)  # sentinel
@@ -355,8 +356,12 @@ Write a clear, concise answer:
             yield {"event": "token", "data": {"token": fallback}}
 
         answer = "".join(answer_chunks)
+    elif sql and sql_results is not None and len(sql_results) == 0:
+        # SQL executed but returned 0 rows
+        answer = "The query ran successfully but returned no results. Try broadening your search or rephrasing the question."
+        yield {"event": "token", "data": {"token": answer}}
     else:
-        # No SQL results — clean up the response (remove SQL blocks)
+        # No SQL or SQL failed — clean up the response (remove SQL blocks)
         answer = re.sub(r'```sql.*?```', '', full_text, flags=re.DOTALL).strip()
         if not answer:
             answer = full_text
