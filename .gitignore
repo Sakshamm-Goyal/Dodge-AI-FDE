@@ -33,3 +33,9 @@ Thumbs.db
 
 # gstack
 .gstack/
+
+# Playwright
+.playwright-mcp/
+
+# Screenshots
+*.png

@@ -17,15 +17,21 @@ export function useChat() {
       addMessage(userMsg);
       setChatLoading(true);
 
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
       try {
         const res = await fetch(`${API_BASE}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ query, sessionId }),
+          signal: controller.signal,
         });
 
+        clearTimeout(timeout);
+
         if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
+          throw new Error(`Server error (${res.status}). Please try again.`);
         }
 
         const reader = res.body?.getReader();
@@ -37,36 +43,59 @@ export function useChat() {
         let answer = '';
         let nodeIds: string[] = [];
         let resultCount = 0;
+        let hasError = false;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
 
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              const eventType = line.slice(7).trim();
-              // Next data line
-              const dataIdx = lines.indexOf(line) + 1;
-              if (dataIdx < lines.length && lines[dataIdx].startsWith('data: ')) {
-                // handled below
+          // SSE events are separated by double newlines
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || ''; // Keep incomplete event in buffer
+
+          for (const eventBlock of events) {
+            if (!eventBlock.trim()) continue;
+
+            const lines = eventBlock.split('\n');
+            let eventType = 'message';
+            let eventData = '';
+
+            for (const line of lines) {
+              if (line.startsWith('event: ')) {
+                eventType = line.slice(7).trim();
+              } else if (line.startsWith('data: ')) {
+                eventData = line.slice(6);
               }
-              void eventType;
-            } else if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.sql) sql = data.sql;
-                if (data.answer) answer = data.answer;
-                if (data.nodeIds) nodeIds = data.nodeIds;
-                if (data.resultCount !== undefined)
-                  resultCount = data.resultCount;
-                if (data.message) answer = data.message; // error events
-              } catch {
-                // ignore parse errors
+            }
+
+            if (!eventData) continue;
+
+            try {
+              const data = JSON.parse(eventData);
+
+              switch (eventType) {
+                case 'sql':
+                  if (data.sql) sql = data.sql;
+                  break;
+                case 'result':
+                  if (data.answer) answer = data.answer;
+                  if (data.nodeIds) nodeIds = data.nodeIds;
+                  if (data.resultCount !== undefined) resultCount = data.resultCount;
+                  if (data.sql && !sql) sql = data.sql;
+                  break;
+                case 'error':
+                  if (data.message) {
+                    answer = data.message;
+                    hasError = true;
+                  }
+                  break;
+                case 'done':
+                  break;
               }
+            } catch {
+              // ignore parse errors for malformed events
             }
           }
         }
@@ -74,25 +103,30 @@ export function useChat() {
         if (answer) {
           addMessage({
             id: 'assistant-' + Date.now(),
-            role: 'assistant',
+            role: hasError ? 'error' : 'assistant',
             content: answer,
-            sql,
-            nodeIds,
-            resultCount,
+            sql: hasError ? undefined : sql,
+            nodeIds: hasError ? undefined : nodeIds,
+            resultCount: hasError ? undefined : resultCount,
           });
 
-          if (nodeIds.length > 0) {
+          if (!hasError && nodeIds.length > 0) {
             setHighlightedNodeIds(nodeIds);
           }
         }
       } catch (err) {
+        clearTimeout(timeout);
+        const message =
+          err instanceof DOMException && err.name === 'AbortError'
+            ? 'Request timed out. The AI service may be slow — please try again.'
+            : err instanceof Error
+              ? err.message
+              : 'Something went wrong. Please try again.';
+
         addMessage({
           id: 'error-' + Date.now(),
           role: 'error',
-          content:
-            err instanceof Error
-              ? err.message
-              : 'Something went wrong. Please try again.',
+          content: message,
         });
       } finally {
         setChatLoading(false);

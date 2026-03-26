@@ -5,26 +5,38 @@ import type { GraphNode } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
+// Vibrant colors — blue family for process nodes, warm for entity nodes
 const TYPE_COLORS: Record<string, string> = {
-  SalesOrder: '#6366f1',
-  Delivery: '#3b82f6',
-  BillingDocument: '#60a5fa',
-  JournalEntry: '#93c5fd',
-  Payment: '#e879a0',
-  Customer: '#f472b6',
-  Product: '#fb7185',
-  Plant: '#a78bfa',
+  SalesOrder: '#4f46e5',
+  Delivery: '#2563eb',
+  BillingDocument: '#3b82f6',
+  JournalEntry: '#6366f1',
+  Payment: '#e11d48',
+  Customer: '#ec4899',
+  Product: '#f43f5e',
+  Plant: '#8b5cf6',
 };
 
 const TYPE_DISPLAY: Record<string, string> = {
   SalesOrder: 'Sales Order',
   Delivery: 'Delivery',
-  BillingDocument: 'Billing Document',
+  BillingDocument: 'Billing Doc',
   JournalEntry: 'Journal Entry',
   Payment: 'Payment',
   Customer: 'Customer',
   Product: 'Product',
   Plant: 'Plant',
+};
+
+// Edge colors by relationship type
+const EDGE_COLORS: Record<string, string> = {
+  HAS_ITEM: '#8b5cf6',
+  SOLD_TO: '#ec4899',
+  DELIVERED_BY: '#2563eb',
+  BILLED_IN: '#3b82f6',
+  POSTED_AS: '#6366f1',
+  CLEARED_BY: '#e11d48',
+  FROM_PLANT: '#22c55e',
 };
 
 interface Props {
@@ -48,6 +60,7 @@ export default function GraphPanel({ showLabels }: Props) {
   const graphRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const prevHighlightRef = useRef<Set<string>>(new Set());
 
   // Track container size
   useEffect(() => {
@@ -61,12 +74,74 @@ export default function GraphPanel({ showLabels }: Props) {
     return () => obs.disconnect();
   }, []);
 
-  // Fetch initial graph data
+  // Customize d3 forces for a wide, spread-out layout
+  useEffect(() => {
+    const fg = graphRef.current;
+    if (!fg) return;
+    fg.d3Force('charge')?.strength(-200);
+    fg.d3Force('link')?.distance(35).strength(0.5);
+    fg.d3Force('center')?.strength(0.05);
+    fg.d3ReheatSimulation();
+  }, [nodes]);
+
+  // Auto-zoom to highlighted nodes when chat highlights change
+  useEffect(() => {
+    const fg = graphRef.current;
+    if (!fg || highlightedNodeIds.size === 0) return;
+    // Only zoom when highlights actually changed (not on every re-render)
+    const prev = prevHighlightRef.current;
+    const changed = highlightedNodeIds.size !== prev.size ||
+      [...highlightedNodeIds].some(id => !prev.has(id));
+    if (!changed) return;
+    prevHighlightRef.current = new Set(highlightedNodeIds);
+
+    // Find the highlighted nodes and zoom to fit them
+    const hlNodes = nodes.filter(n => highlightedNodeIds.has(n.id));
+    if (hlNodes.length === 0) return;
+
+    // For a single node, center on it
+    if (hlNodes.length === 1) {
+      const n = hlNodes[0];
+      if (n.x != null && n.y != null) {
+        fg.centerAt(n.x, n.y, 800);
+        fg.zoom(4, 800);
+      }
+      return;
+    }
+
+    // For multiple nodes, zoom to fit them all with some padding
+    const validNodes = hlNodes.filter(n => n.x != null && n.y != null);
+    if (validNodes.length === 0) return;
+
+    const xs = validNodes.map(n => n.x!);
+    const ys = validNodes.map(n => n.y!);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+
+    fg.centerAt(cx, cy, 800);
+    // Zoom level based on spread — closer for tight clusters
+    const spread = Math.max(maxX - minX, maxY - minY, 50);
+    const targetZoom = Math.min(8, Math.max(1.5, 400 / spread));
+    fg.zoom(targetZoom, 800);
+  }, [highlightedNodeIds, nodes]);
+
+  // After engine settles, zoom in to fill the viewport
+  const handleEngineStop = useCallback(() => {
+    const fg = graphRef.current;
+    if (!fg) return;
+    fg.zoomToFit(400, 40);
+  }, []);
+
+  // Fetch initial graph data — load all nodes for a dense graph
   useEffect(() => {
     const fetchGraph = async () => {
       try {
         const [graphRes, typesRes] = await Promise.all([
-          fetch(`${API_BASE}/api/graph?limit=500`),
+          fetch(`${API_BASE}/api/graph?limit=800`),
           fetch(`${API_BASE}/api/node-types`),
         ]);
         const graphData = await graphRes.json();
@@ -114,55 +189,97 @@ export default function GraphPanel({ showLabels }: Props) {
     [addGraphData, setSelectedNode]
   );
 
-  // Canvas rendering for nodes
+  // Build connection count map from edges
+  const connectionCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const e of edges) {
+      counts[e.source] = (counts[e.source] || 0) + 1;
+      counts[e.target] = (counts[e.target] || 0) + 1;
+    }
+    return counts;
+  }, [edges]);
+
+  // Canvas rendering for nodes — solid filled circles with labels
   const paintNode = useCallback(
     (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const isHighlighted = highlightedNodeIds.has(node.id);
       const isSelected = selectedNode?.id === node.id;
-      const baseRadius = isHighlighted ? 5 : isSelected ? 4.5 : 3.5;
+      const conns = connectionCounts[node.id] || 0;
 
+      // Size nodes by connectivity — hub nodes are bigger
+      const baseRadius = isHighlighted ? 6 : isSelected ? 5.5 : Math.max(3, Math.min(5, 2.5 + conns * 0.3));
       const color = node.color || '#94a3b8';
 
-      // Highlighted glow
+      // Highlighted glow rings — pulsing effect
       if (isHighlighted) {
         ctx.beginPath();
-        ctx.arc(node.x, node.y, baseRadius + 8, 0, 2 * Math.PI);
-        ctx.fillStyle = color + '15';
+        ctx.arc(node.x, node.y, baseRadius + 12, 0, 2 * Math.PI);
+        ctx.fillStyle = color + '10';
         ctx.fill();
 
         ctx.beginPath();
-        ctx.arc(node.x, node.y, baseRadius + 4, 0, 2 * Math.PI);
-        ctx.fillStyle = color + '30';
+        ctx.arc(node.x, node.y, baseRadius + 7, 0, 2 * Math.PI);
+        ctx.fillStyle = color + '20';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, baseRadius + 3, 0, 2 * Math.PI);
+        ctx.fillStyle = color + '35';
         ctx.fill();
       }
 
-      // Node with border
+      // Selected ring
+      if (isSelected) {
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, baseRadius + 3, 0, 2 * Math.PI);
+        ctx.strokeStyle = color + '50';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Solid filled node
       ctx.beginPath();
       ctx.arc(node.x, node.y, baseRadius, 0, 2 * Math.PI);
-      ctx.fillStyle = '#ffffff';
+      ctx.fillStyle = isHighlighted ? color : color;
       ctx.fill();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = isSelected ? 2.5 : isHighlighted ? 2 : 1.5;
+
+      // White border for contrast
+      ctx.strokeStyle = isHighlighted ? '#ffffff' : '#ffffff';
+      ctx.lineWidth = isHighlighted ? 2 : isSelected ? 1.5 : 0.8;
       ctx.stroke();
 
-      // Inner dot
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, baseRadius * 0.45, 0, 2 * Math.PI);
-      ctx.fillStyle = color;
-      ctx.fill();
-
-      // Label when zoomed in or overlay is on
-      if (showLabels && globalScale > 1.2) {
-        const label = node.type || '';
-        const fontSize = Math.max(9 / globalScale, 2);
-        ctx.font = `500 ${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+      // Show labels: always for highlighted, on zoom for overlay mode
+      const shouldShowLabel = isHighlighted || (showLabels && globalScale > 1.2);
+      if (shouldShowLabel) {
+        // For highlighted nodes, show the ID (e.g., "SO 740506")
+        const label = isHighlighted
+          ? node.label || node.id
+          : TYPE_DISPLAY[node.type] || node.type || '';
+        const fontSize = isHighlighted
+          ? Math.max(12 / globalScale, 3)
+          : Math.max(10 / globalScale, 2.5);
+        ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillStyle = '#64748b';
+
+        // Text background for readability
+        if (isHighlighted) {
+          const metrics = ctx.measureText(label);
+          const pad = 2 / globalScale;
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.fillRect(
+            node.x - metrics.width / 2 - pad,
+            node.y + baseRadius + 1,
+            metrics.width + pad * 2,
+            fontSize + pad
+          );
+        }
+
+        ctx.fillStyle = isHighlighted ? '#0f172a' : '#334155';
         ctx.fillText(label, node.x, node.y + baseRadius + 2);
       }
     },
-    [highlightedNodeIds, selectedNode, showLabels]
+    [highlightedNodeIds, selectedNode, showLabels, connectionCounts]
   );
 
   // Graph data formatted for react-force-graph
@@ -193,30 +310,46 @@ export default function GraphPanel({ showLabels }: Props) {
         nodeCanvasObject={paintNode}
         nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
           ctx.beginPath();
-          ctx.arc(node.x, node.y, 8, 0, 2 * Math.PI);
+          ctx.arc(node.x, node.y, 10, 0, 2 * Math.PI);
           ctx.fillStyle = color;
           ctx.fill();
         }}
-        linkColor={() => '#bfdbfe'}
+        linkColor={(link: any) => {
+          const linkType = link.type || '';
+          const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+          const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+          const isHl = highlightedNodeIds.has(srcId) && highlightedNodeIds.has(tgtId);
+          if (isHl) return EDGE_COLORS[linkType] || '#4f46e5';
+          return EDGE_COLORS[linkType] ? EDGE_COLORS[linkType] + '50' : '#cbd5e1';
+        }}
         linkWidth={(link: any) => {
           const srcId = typeof link.source === 'object' ? link.source.id : link.source;
           const tgtId = typeof link.target === 'object' ? link.target.id : link.target;
+          const bothHl = highlightedNodeIds.has(srcId) && highlightedNodeIds.has(tgtId);
+          if (bothHl) return 3;
           if (highlightedNodeIds.has(srcId) || highlightedNodeIds.has(tgtId)) return 2;
-          return 0.8;
+          return 1;
         }}
-        linkDirectionalArrowLength={0}
+        linkDirectionalArrowLength={4}
+        linkDirectionalArrowRelPos={0.85}
+        linkCurvature={0}
         onNodeClick={handleNodeClick}
         backgroundColor="#f8fafc"
-        cooldownTicks={100}
-        onEngineStop={() => graphRef.current?.zoomToFit(400, 80)}
-        d3AlphaDecay={0.02}
-        d3VelocityDecay={0.3}
+        cooldownTicks={200}
+        onEngineStop={handleEngineStop}
+        d3AlphaDecay={0.01}
+        d3VelocityDecay={0.2}
+        d3AlphaMin={0.001}
+        warmupTicks={80}
+        minZoom={0.5}
+        maxZoom={12}
       />
 
-      {/* Node tooltip on hover */}
+      {/* Node tooltip on click */}
       {selectedNode && (
         <NodeTooltip
           node={selectedNode}
+          connectionCount={connectionCounts[selectedNode.id] || 0}
           onClose={() => setSelectedNode(null)}
         />
       )}
@@ -224,7 +357,7 @@ export default function GraphPanel({ showLabels }: Props) {
   );
 }
 
-function NodeTooltip({ node, onClose }: { node: GraphNode; onClose: () => void }) {
+function NodeTooltip({ node, connectionCount, onClose }: { node: GraphNode; connectionCount: number; onClose: () => void }) {
   const entries = Object.entries(node.metadata || {});
   const visibleEntries = entries.slice(0, 12);
   const hasMore = entries.length > 12;
@@ -253,9 +386,7 @@ function NodeTooltip({ node, onClose }: { node: GraphNode; onClose: () => void }
         )}
         <div className="tooltip-row connections">
           <span className="tooltip-key">Connections</span>
-          <span className="tooltip-val">{
-            Object.keys(node.metadata || {}).length > 0 ? '...' : '0'
-          }</span>
+          <span className="tooltip-val">{connectionCount}</span>
         </div>
       </div>
     </div>
