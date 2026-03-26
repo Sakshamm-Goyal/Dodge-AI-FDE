@@ -28,6 +28,7 @@ interface AppStore {
   setHighlightedNodeIds: (ids: string[]) => void;
   clearHighlights: () => void;
   addMessage: (msg: ChatMessage) => void;
+  updateMessage: (id: string, content: string, extra?: Partial<ChatMessage>) => void;
   setChatLoading: (loading: boolean) => void;
   setNodeTypes: (types: Record<string, { prefix: string; color: string; label: string }>) => void;
 }
@@ -85,6 +86,13 @@ export const useStore = create<AppStore>((set) => ({
 
   addMessage: (msg) =>
     set((state) => ({ messages: [...state.messages, msg] })),
+
+  updateMessage: (id, content, extra) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, content, ...extra } : m
+      ),
+    })),
 
   setChatLoading: (loading) => set({ chatLoading: loading }),
 

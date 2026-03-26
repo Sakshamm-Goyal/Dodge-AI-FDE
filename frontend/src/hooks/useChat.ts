@@ -4,7 +4,7 @@ import { useStore } from '../store';
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
 export function useChat() {
-  const { addMessage, setChatLoading, setHighlightedNodeIds, sessionId } =
+  const { addMessage, updateMessage, setChatLoading, setHighlightedNodeIds, sessionId } =
     useStore();
 
   const sendMessage = useCallback(
@@ -41,9 +41,12 @@ export function useChat() {
         let buffer = '';
         let sql: string | undefined;
         let answer = '';
+        let streamedText = '';
         let nodeIds: string[] = [];
         let resultCount = 0;
         let hasError = false;
+        let streamMsgId = 'assistant-' + Date.now();
+        let isStreaming = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -79,6 +82,23 @@ export function useChat() {
                 case 'sql':
                   if (data.sql) sql = data.sql;
                   break;
+                case 'token':
+                  // Progressive streaming — update message in place
+                  if (data.token) {
+                    streamedText += data.token;
+                    if (!isStreaming) {
+                      isStreaming = true;
+                      addMessage({
+                        id: streamMsgId,
+                        role: 'assistant',
+                        content: streamedText,
+                        sql,
+                      });
+                    } else {
+                      updateMessage(streamMsgId, streamedText);
+                    }
+                  }
+                  break;
                 case 'result':
                   if (data.answer) answer = data.answer;
                   if (data.nodeIds) nodeIds = data.nodeIds;
@@ -101,14 +121,23 @@ export function useChat() {
         }
 
         if (answer) {
-          addMessage({
-            id: 'assistant-' + Date.now(),
-            role: hasError ? 'error' : 'assistant',
-            content: answer,
-            sql: hasError ? undefined : sql,
-            nodeIds: hasError ? undefined : nodeIds,
-            resultCount: hasError ? undefined : resultCount,
-          });
+          if (isStreaming) {
+            // Update the streaming message with final data (nodeIds, resultCount)
+            updateMessage(streamMsgId, answer, {
+              sql: hasError ? undefined : sql,
+              nodeIds: hasError ? undefined : nodeIds,
+              resultCount: hasError ? undefined : resultCount,
+            });
+          } else {
+            addMessage({
+              id: streamMsgId,
+              role: hasError ? 'error' : 'assistant',
+              content: answer,
+              sql: hasError ? undefined : sql,
+              nodeIds: hasError ? undefined : nodeIds,
+              resultCount: hasError ? undefined : resultCount,
+            });
+          }
 
           if (!hasError && nodeIds.length > 0) {
             setHighlightedNodeIds(nodeIds);
@@ -132,7 +161,7 @@ export function useChat() {
         setChatLoading(false);
       }
     },
-    [addMessage, setChatLoading, setHighlightedNodeIds, sessionId]
+    [addMessage, updateMessage, setChatLoading, setHighlightedNodeIds, sessionId]
   );
 
   return { sendMessage };

@@ -37,6 +37,10 @@ Thumbs.db
 # Playwright
 .playwright-mcp/
 
+# Session logs
+session-logs/
+*.zip
+
 # Screenshots (except Sample-Image/)
 *.png
 !Sample-Image/*.png

@@ -148,6 +148,21 @@ def _call_gemini(model, messages, temperature=0.1, max_tokens=2048):
     return response.text
 
 
+def _stream_gemini(model, messages, temperature=0.1, max_tokens=1024):
+    """Synchronous streaming Gemini call — yields text chunks."""
+    response = model.generate_content(
+        messages,
+        generation_config=genai.types.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        ),
+        stream=True,
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
+
 async def process_chat_query(query: str, session_id: str, conn: sqlite3.Connection):
     """Process a chat query and yield SSE events."""
     # Layer 1: Domain relevance check (keyword-based, fast)
@@ -245,13 +260,11 @@ async def process_chat_query(query: str, session_id: str, conn: sqlite3.Connecti
         else:
             print(f"[SQL VALIDATION] Rejected: {error}\nSQL: {sql}")
 
-    # Generate clean answer
-    answer = full_text
+    # Generate clean answer — stream it token by token
     if sql_results is not None and len(sql_results) > 0:
-        # Summarize results in natural language
-        try:
-            result_preview = json.dumps(sql_results[:20], default=str)
-            summary_prompt = f"""The user asked: "{query}"
+        # Summarize results with streaming
+        result_preview = json.dumps(sql_results[:20], default=str)
+        summary_prompt = f"""The user asked: "{query}"
 
 SQL executed: {sql}
 
@@ -268,21 +281,47 @@ Write a clear, concise answer:
 - Do NOT include any SQL in your answer
 - Keep it under 200 words"""
 
-            model = _get_model(
-                primary=True,
-                system_instruction="You are a data analyst. Summarize SQL query results clearly and accurately. Use ONLY the data provided in the results — never guess or use prior context. Be concise and specific. Use bold for key values.",
-            )
-            answer = await asyncio.to_thread(
-                _call_gemini, model, [{"role": "user", "parts": [summary_prompt]}], 0.2, 1024
-            )
+        model = _get_model(
+            primary=True,
+            system_instruction="You are a data analyst. Summarize SQL query results clearly and accurately. Use ONLY the data provided in the results — never guess or use prior context. Be concise and specific. Use bold for key values.",
+        )
+
+        # Stream the summary token by token via async queue
+        answer_chunks = []
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+
+            def _run_stream():
+                try:
+                    for chunk in _stream_gemini(model, [{"role": "user", "parts": [summary_prompt]}], 0.2, 1024):
+                        queue.put_nowait(chunk)
+                finally:
+                    queue.put_nowait(None)  # sentinel
+
+            # Start streaming in background thread
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, _run_stream)
+
+            # Yield chunks as they arrive
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                answer_chunks.append(chunk)
+                yield {"event": "token", "data": {"token": chunk}}
         except Exception:
-            # Strip SQL blocks from original response as fallback
-            answer = re.sub(r'```sql.*?```', '', full_text, flags=re.DOTALL).strip()
+            # Fallback: strip SQL blocks from original response
+            fallback = re.sub(r'```sql.*?```', '', full_text, flags=re.DOTALL).strip()
+            answer_chunks = [fallback]
+            yield {"event": "token", "data": {"token": fallback}}
+
+        answer = "".join(answer_chunks)
     else:
         # No SQL results — clean up the response (remove SQL blocks)
         answer = re.sub(r'```sql.*?```', '', full_text, flags=re.DOTALL).strip()
         if not answer:
             answer = full_text
+        yield {"event": "token", "data": {"token": answer}}
 
     # Store assistant response in conversation memory
     conversations[session_id].append({"role": "model", "content": answer})
