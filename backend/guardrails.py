@@ -1,13 +1,14 @@
-"""3-layer guardrails for query validation.
+"""Multi-layer guardrails for query validation.
 
-Layer 1: Fast blocklist — reject obvious off-topic, prompt injection, and abuse.
-         Everything else passes to Layer 2 (LLM with domain-restricted system prompt).
-Layer 2: System prompt restriction (built into llm.py system prompt)
-Layer 3: SQL output validation (safety + correctness)
+Layer 0: Input sanitization (Unicode normalization, length limits)
+Layer 1: Fast blocklist (prompt injection + clearly off-topic, no LLM cost)
+Layer 2: LLM system prompt restriction (built into llm.py)
+Layer 3: SQL output validation (safety, correctness, anti-exfiltration)
 """
 from __future__ import annotations
 
 import re
+import unicodedata
 import sqlparse
 
 KNOWN_TABLES = {
@@ -27,10 +28,33 @@ REJECTION_MESSAGE = (
     "payments, customers, products, or related business processes."
 )
 
+MAX_QUERY_LENGTH = 2000
+
+# --- Layer 0: Input sanitization ---
+
+def sanitize_input(query: str) -> str:
+    """Normalize input to prevent Unicode bypass attacks.
+
+    Strips zero-width characters, normalizes homoglyphs (e.g. Cyrillic 'а' → Latin 'a'),
+    and enforces length limits. Without this, regex blocklists can be trivially bypassed.
+    """
+    # Strip zero-width and invisible Unicode characters
+    query = re.sub(r'[\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff\u00ad]', '', query)
+    # Normalize Unicode homoglyphs (NFKC maps look-alikes to canonical forms)
+    query = unicodedata.normalize('NFKC', query)
+    # Collapse excessive whitespace
+    query = re.sub(r'\s+', ' ', query).strip()
+    # Length limit
+    if len(query) > MAX_QUERY_LENGTH:
+        query = query[:MAX_QUERY_LENGTH]
+    return query
+
+
 # --- Layer 1: Blocklist-based fast rejection ---
 
 # Prompt injection / role override attempts
 _INJECTION_PATTERNS = [
+    # Classic role override
     r"ignore\s+(all\s+)?(previous|prior|above|your)",
     r"forget\s+(all\s+)?(previous|prior|above|your)",
     r"disregard\s+(all\s+)?(previous|prior|above|your)",
@@ -38,13 +62,26 @@ _INJECTION_PATTERNS = [
     r"act\s+as\b",
     r"pretend\s+(to\s+be|you)",
     r"new\s+role",
-    r"system\s*prompt",
     r"override\s+(instruction|rule|mode)",
     r"admin\s+(mode|access|command)",
     r"developer\s+mode",
     r"jailbreak",
     r"do\s+anything\s+now",
     r"DAN\b",
+    # 2025-era injection patterns
+    r"repeat\s+after\s+me",
+    r"roleplay\s+as",
+    r"from\s+now\s+on",
+    r"IMPORTANT\s*:",
+    r"<\s*system\s*>",
+    r"\[INST\]",
+    r"###\s*(system|instruction|human|assistant)",
+    r"respond\s+(only\s+)?in\s+(json|xml|html)\b",
+    # System prompt extraction
+    r"system\s*prompt",
+    r"show\s+(me\s+)?(your|the)\s+(instruction|prompt|rules)",
+    r"what\s+are\s+your\s+(instruction|rules|guidelines)",
+    r"reveal\s+(your\s+)?(instruction|prompt|system)",
 ]
 
 # Clearly off-topic requests (no ambiguity — these are never O2C)
@@ -72,33 +109,38 @@ def check_domain_relevance(query: str, has_history: bool = False) -> tuple[bool,
     """Layer 1: Blocklist-based fast rejection.
 
     Strategy: block what's clearly wrong, let everything else through to the LLM.
-    The LLM system prompt (Layer 2) handles nuanced domain filtering.
+    The LLM system prompt (Layer 2) handles nuanced domain filtering — it's far
+    better at understanding intent, typos, and abbreviations than regex.
 
-    This avoids false rejections for typos, abbreviations, or unusual phrasing
-    of legitimate O2C questions.
+    This avoids false rejections while still catching:
+    - Prompt injection attempts (security)
+    - Obviously off-topic requests (saves API cost)
     """
-    query_stripped = query.strip()
+    # Layer 0: sanitize first
+    query_clean = sanitize_input(query)
 
     # Empty or single-char queries
-    if len(query_stripped) < 2:
+    if len(query_clean) < 2:
         return False, REJECTION_MESSAGE
 
     # Block prompt injection attempts — always, regardless of history
     for pattern in _INJECTION_RE:
-        if pattern.search(query_stripped):
+        if pattern.search(query_clean):
             return False, REJECTION_MESSAGE
 
     # Block clearly off-topic requests
     for pattern in _OFFTOPIC_RE:
-        if pattern.search(query_stripped):
+        if pattern.search(query_clean):
             return False, REJECTION_MESSAGE
 
     # Everything else goes to Layer 2 (LLM with domain-restricted system prompt)
     return True, None
 
 
+# --- Layer 3: SQL output validation ---
+
 def validate_sql(sql: str) -> tuple[bool, str | None]:
-    """Layer 3: Validate generated SQL for safety and correctness."""
+    """Validate generated SQL for safety, correctness, and anti-exfiltration."""
     if not sql or not sql.strip():
         return False, "No SQL generated"
 
@@ -108,16 +150,32 @@ def validate_sql(sql: str) -> tuple[bool, str | None]:
     if not sql_upper.lstrip().startswith("SELECT"):
         return False, "Only SELECT queries are allowed"
 
-    # Check for dangerous operations (even in subqueries)
+    # Dangerous write/DDL operations
     dangerous_patterns = [
         r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|TRUNCATE|REPLACE)\b',
         r'\b(ATTACH|DETACH)\b',
         r'\b(PRAGMA)\b',
-        r';\s*(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE)',  # piggyback statements
+        r';\s*(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE)',
     ]
     for pattern in dangerous_patterns:
         if re.search(pattern, sql_upper):
             return False, "Only SELECT queries are allowed for safety"
+
+    # SQLite exfiltration / introspection protection
+    exfiltration_patterns = [
+        r'\bsqlite_master\b',
+        r'\bsqlite_version\b',
+        r'\bsqlite_temp_master\b',
+        r'\bLOAD_EXTENSION\b',
+        r'\bfts[345]\b',
+        r'\bRANDOMBLOB\b',
+        r'\bZEROBLOB\b',
+        r'\breadfile\b',
+        r'\bwritefile\b',
+    ]
+    for pattern in exfiltration_patterns:
+        if re.search(pattern, sql, re.IGNORECASE):
+            return False, "Access to system tables is not allowed"
 
     # Parse SQL for basic validity
     try:
@@ -127,7 +185,7 @@ def validate_sql(sql: str) -> tuple[bool, str | None]:
     except Exception:
         return False, "SQL parsing failed"
 
-    # Extract and validate table references
+    # Validate table references against known schema
     table_pattern = r'(?:FROM|JOIN)\s+"?(\w+)"?'
     referenced_tables = set(re.findall(table_pattern, sql, re.IGNORECASE))
 
