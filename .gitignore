@@ -37,5 +37,6 @@ Thumbs.db
 # Playwright
 .playwright-mcp/
 
-# Screenshots
+# Screenshots (except Sample-Image/)
 *.png
+!Sample-Image/*.png
