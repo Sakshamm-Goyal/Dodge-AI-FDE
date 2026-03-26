@@ -1,6 +1,7 @@
 """3-layer guardrails for query validation.
 
-Layer 1: Domain relevance check (keyword + pattern matching, fast, no LLM)
+Layer 1: Fast blocklist — reject obvious off-topic, prompt injection, and abuse.
+         Everything else passes to Layer 2 (LLM with domain-restricted system prompt).
 Layer 2: System prompt restriction (built into llm.py system prompt)
 Layer 3: SQL output validation (safety + correctness)
 """
@@ -8,25 +9,6 @@ from __future__ import annotations
 
 import re
 import sqlparse
-
-# Strong O2C domain keywords — terms that almost always indicate O2C context
-# Avoids common English words like "date", "total", "status" that cause false positives
-STRONG_KEYWORDS = {
-    "order", "sales order", "purchase order", "delivery", "billing", "invoice",
-    "payment", "journal", "journal entry", "customer", "product", "plant",
-    "material", "document", "shipped", "delivered", "billed", "posted",
-    "cleared", "cancelled", "o2c", "order to cash", "sap", "erp",
-    "receivable", "fiscal", "warehouse", "storage", "supplier",
-    "sales", "outbound", "inbound", "accounting", "ledger", "debit", "credit",
-    "billing document", "delivery document", "sales order", "journal entry",
-    "business partner", "company code",
-}
-
-# Weaker domain signals — only match if combined with other context
-WEAK_KEYWORDS = {
-    "flow", "trace", "broken", "incomplete", "amount", "currency",
-    "quantity", "net", "gross", "status", "total", "date",
-}
 
 KNOWN_TABLES = {
     "sales_order_headers", "sales_order_items", "sales_order_schedule_lines",
@@ -45,55 +27,74 @@ REJECTION_MESSAGE = (
     "payments, customers, products, or related business processes."
 )
 
+# --- Layer 1: Blocklist-based fast rejection ---
+
+# Prompt injection / role override attempts
+_INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above|your)",
+    r"forget\s+(all\s+)?(previous|prior|above|your)",
+    r"disregard\s+(all\s+)?(previous|prior|above|your)",
+    r"you\s+are\s+now\b",
+    r"act\s+as\b",
+    r"pretend\s+(to\s+be|you)",
+    r"new\s+role",
+    r"system\s*prompt",
+    r"override\s+(instruction|rule|mode)",
+    r"admin\s+(mode|access|command)",
+    r"developer\s+mode",
+    r"jailbreak",
+    r"do\s+anything\s+now",
+    r"DAN\b",
+]
+
+# Clearly off-topic requests (no ambiguity — these are never O2C)
+_OFFTOPIC_PATTERNS = [
+    r"\b(weather|forecast|temperature)\s+(in|for|today|tomorrow)\b",
+    r"\bwrite\s+(me\s+)?(a\s+)?(poem|story|essay|song|code|script|letter|email)\b",
+    r"\b(compose|generate)\s+(a\s+)?(poem|story|essay|song|lyrics)\b",
+    r"\btranslate\s+.+\s+(to|into)\s+\w+",
+    r"\b(recipe|cook|bake|ingredient)\b.*\b(for|how)\b",
+    r"\b(who\s+is|tell\s+me\s+about)\s+(elon|trump|biden|modi|taylor|obama)\b",
+    r"\b(capital|president|population)\s+of\s+\w+",
+    r"\bhello\s+world\b",
+    r"\b(play|sing|hum)\s+(me\s+)?(a\s+)?song\b",
+    r"\b(what\s+is\s+the\s+meaning\s+of\s+life)\b",
+    r"\btell\s+(me\s+)?a\s+joke\b",
+    r"\b(tic\s*tac\s*toe|chess|game)\b",
+]
+
+# Compiled for performance
+_INJECTION_RE = [re.compile(p, re.IGNORECASE) for p in _INJECTION_PATTERNS]
+_OFFTOPIC_RE = [re.compile(p, re.IGNORECASE) for p in _OFFTOPIC_PATTERNS]
+
 
 def check_domain_relevance(query: str, has_history: bool = False) -> tuple[bool, str | None]:
-    """Layer 1: Check if query is related to O2C domain.
+    """Layer 1: Blocklist-based fast rejection.
 
-    Uses a tiered keyword approach:
-    - Strong keywords: any single match = relevant
-    - Weak keywords: need 2+ matches to be relevant
-    - Document number patterns: relevant (user referencing specific IDs)
-    - Short follow-ups with conversation history: let LLM (Layer 2) decide
+    Strategy: block what's clearly wrong, let everything else through to the LLM.
+    The LLM system prompt (Layer 2) handles nuanced domain filtering.
+
+    This avoids false rejections for typos, abbreviations, or unusual phrasing
+    of legitimate O2C questions.
     """
-    query_lower = query.lower()
+    query_stripped = query.strip()
 
-    # Check for strong O2C keywords
-    for keyword in STRONG_KEYWORDS:
-        if keyword in query_lower:
-            return True, None
+    # Empty or single-char queries
+    if len(query_stripped) < 2:
+        return False, REJECTION_MESSAGE
 
-    # Check for document number patterns (6+ digit IDs)
-    if re.search(r'\b\d{6,}\b', query):
-        return True, None
+    # Block prompt injection attempts — always, regardless of history
+    for pattern in _INJECTION_RE:
+        if pattern.search(query_stripped):
+            return False, REJECTION_MESSAGE
 
-    # Check weak keywords — need at least 2 matches for relevance
-    weak_count = sum(1 for kw in WEAK_KEYWORDS if kw in query_lower)
-    if weak_count >= 2:
-        return True, None
+    # Block clearly off-topic requests
+    for pattern in _OFFTOPIC_RE:
+        if pattern.search(query_stripped):
+            return False, REJECTION_MESSAGE
 
-    # Check for table name references
-    for table in KNOWN_TABLES:
-        if table in query_lower or table.replace("_", " ") in query_lower:
-            return True, None
-
-    # If there's conversation history and query is short/conversational,
-    # let it through to Layer 2 (LLM system prompt) — it could be a follow-up
-    # like "tell me more", "show top 5", "what about cancelled ones?"
-    if has_history and len(query.strip()) < 100:
-        # Still block clearly off-topic attempts (prompt injection, etc.)
-        off_topic_signals = [
-            "write me", "compose", "poem", "story", "weather",
-            "recipe", "joke", "sing", "translate", "code me",
-            "hello world", "ignore", "forget", "pretend",
-            "you are now", "act as", "admin", "system prompt",
-        ]
-        for signal in off_topic_signals:
-            if signal in query_lower:
-                return False, REJECTION_MESSAGE
-        # Let Layer 2 handle ambiguous follow-ups
-        return True, None
-
-    return False, REJECTION_MESSAGE
+    # Everything else goes to Layer 2 (LLM with domain-restricted system prompt)
+    return True, None
 
 
 def validate_sql(sql: str) -> tuple[bool, str | None]:
